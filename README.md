@@ -1,6 +1,6 @@
 # Havwatch - Price Alert Monitor
 
-**[Live Demo](https://havwatch.vercel.app)**
+**Demo:** https://havwatch.vercel.app
 
 A real-time cryptocurrency price alert system powered by the [Havklo SDK](https://github.com/hitakshiA/Havklo_sdk). Set price alerts and get notified when thresholds are crossed.
 
