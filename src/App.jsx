@@ -1,29 +1,92 @@
-import { useState, useEffect, useRef } from 'react'
-import initWasm, { WasmOrderbook } from 'kraken-wasm'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import initWasm, { WasmOrderbook } from '../wasm/kraken_wasm.js'
 
-const SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD']
+const SYMBOLS = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD', 'ADA/USD']
+
+// Precision settings for checksum calculation
+const SYMBOL_PRECISION = {
+  'BTC/USD': [1, 8],
+  'ETH/USD': [2, 8],
+  'SOL/USD': [2, 8],
+  'XRP/USD': [5, 8],
+  'ADA/USD': [6, 8],
+}
 
 export default function App() {
   const [status, setStatus] = useState('Initializing...')
+  const [sdkReady, setSdkReady] = useState(false)
   const [prices, setPrices] = useState({})
   const [alerts, setAlerts] = useState([
     { id: 1, symbol: 'BTC/USD', type: 'above', price: 100000, active: true },
-    { id: 2, symbol: 'ETH/USD', type: 'below', price: 3000, active: true },
+    { id: 2, symbol: 'ETH/USD', type: 'below', price: 2500, active: true },
+    { id: 3, symbol: 'SOL/USD', type: 'above', price: 150, active: true },
   ])
   const [alertHistory, setAlertHistory] = useState([])
   const [newAlert, setNewAlert] = useState({ symbol: 'BTC/USD', type: 'above', price: '' })
+
   const booksRef = useRef({})
   const wsRef = useRef(null)
+  const messageQueueRef = useRef([])
+  const processingRef = useRef(false)
+
+  // Process messages sequentially
+  const processNextMessage = useCallback(() => {
+    if (processingRef.current) return
+    if (messageQueueRef.current.length === 0) return
+
+    processingRef.current = true
+    const { symbol, data } = messageQueueRef.current.shift()
+
+    try {
+      const book = booksRef.current[symbol]
+      if (!book) {
+        processingRef.current = false
+        if (messageQueueRef.current.length > 0) setTimeout(processNextMessage, 0)
+        return
+      }
+
+      const result = book.apply_and_get(data, 10)
+
+      if (result && (result.msg_type === 'update' || result.msg_type === 'snapshot')) {
+        if (result.mid_price > 0) {
+          setPrices(prev => ({ ...prev, [symbol]: result.mid_price }))
+        }
+      }
+    } catch (e) {
+      // Silently ignore errors
+    } finally {
+      processingRef.current = false
+      if (messageQueueRef.current.length > 0) {
+        setTimeout(processNextMessage, 0)
+      }
+    }
+  }, [])
+
+  const queueMessage = useCallback((symbol, data) => {
+    messageQueueRef.current.push({ symbol, data })
+    if (messageQueueRef.current.length > 200) {
+      messageQueueRef.current = messageQueueRef.current.slice(-100)
+    }
+    processNextMessage()
+  }, [processNextMessage])
 
   useEffect(() => {
     let mounted = true
 
     async function init() {
+      console.log('[HAVWATCH] Initializing Havklo SDK...')
       await initWasm()
       if (!mounted) return
 
+      console.log('[HAVWATCH] SDK ready')
+      setSdkReady(true)
+
+      // Create orderbooks with correct precision
       SYMBOLS.forEach(sym => {
-        booksRef.current[sym] = new WasmOrderbook()
+        const book = WasmOrderbook.with_depth(sym, 10)
+        const [pricePrecision, qtyPrecision] = SYMBOL_PRECISION[sym] || [2, 8]
+        book.set_precision(pricePrecision, qtyPrecision)
+        booksRef.current[sym] = book
       })
 
       setStatus('Connecting...')
@@ -31,6 +94,8 @@ export default function App() {
       wsRef.current = ws
 
       ws.onopen = () => {
+        if (!mounted) return
+        console.log('[HAVWATCH] WebSocket connected')
         setStatus('Connected')
         ws.send(JSON.stringify({
           method: 'subscribe',
@@ -39,23 +104,19 @@ export default function App() {
       }
 
       ws.onmessage = (event) => {
-        const data = JSON.parse(event.data)
-        if (data.channel === 'book' && data.data) {
-          const symbol = data.data[0]?.symbol
-          if (symbol && booksRef.current[symbol]) {
-            booksRef.current[symbol].apply_message(event.data)
-            const midPrice = booksRef.current[symbol].get_mid_price()
-            if (midPrice) {
-              setPrices(prev => {
-                const newPrices = { ...prev, [symbol]: midPrice }
-                return newPrices
-              })
-            }
+        if (!mounted) return
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.channel === 'book' && msg.data?.[0]?.symbol) {
+            queueMessage(msg.data[0].symbol, event.data)
           }
-        }
+        } catch (e) {}
       }
 
-      ws.onclose = () => setStatus('Disconnected')
+      ws.onclose = () => {
+        if (!mounted) return
+        setStatus('Disconnected')
+      }
       ws.onerror = () => setStatus('Error')
     }
 
@@ -63,8 +124,11 @@ export default function App() {
     return () => {
       mounted = false
       wsRef.current?.close()
+      Object.values(booksRef.current).forEach(book => {
+        try { book.free() } catch (e) {}
+      })
     }
-  }, [])
+  }, [queueMessage])
 
   // Check alerts
   useEffect(() => {
@@ -109,10 +173,28 @@ export default function App() {
     setAlerts(prev => prev.filter(a => a.id !== id))
   }
 
+  const formatPrice = (price) => {
+    if (price >= 1000) return price.toFixed(2)
+    if (price >= 1) return price.toFixed(4)
+    return price.toFixed(6)
+  }
+
   return (
     <div style={styles.container}>
       <header style={styles.header}>
-        <h1 style={styles.title}>HAVWATCH</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <h1 style={styles.title}>HAVWATCH</h1>
+          <span style={{
+            fontSize: '10px',
+            padding: '2px 6px',
+            background: sdkReady ? '#00D9FF' : '#666',
+            color: '#0a0e14',
+            borderRadius: '4px',
+            fontWeight: 'bold'
+          }}>
+            SDK
+          </span>
+        </div>
         <div style={styles.statusBar}>
           <span style={{
             ...styles.statusDot,
@@ -129,7 +211,7 @@ export default function App() {
             <div key={sym} style={styles.priceRow}>
               <span style={styles.symbol}>{sym}</span>
               <span style={styles.price}>
-                ${prices[sym]?.toLocaleString(undefined, { minimumFractionDigits: 2 }) || '---'}
+                ${prices[sym] ? formatPrice(prices[sym]) : '---'}
               </span>
             </div>
           ))}
@@ -184,7 +266,7 @@ export default function App() {
               <div key={h.id} style={styles.historyItem}>
                 <span style={styles.historyTime}>{h.time}</span>
                 <span style={styles.historyBell}>🔔</span>
-                <span>{h.symbol} crossed ${h.targetPrice.toLocaleString()} (was ${h.actualPrice.toLocaleString()})</span>
+                <span>{h.symbol} crossed ${formatPrice(h.targetPrice)} (was ${formatPrice(h.actualPrice)})</span>
               </div>
             ))}
             {alertHistory.length === 0 && (
@@ -193,6 +275,10 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      <footer style={styles.footer}>
+        Powered by <span style={{ color: '#00D9FF' }}>Havklo SDK</span> | Real-time data from Kraken WebSocket v2
+      </footer>
     </div>
   )
 }
@@ -204,6 +290,8 @@ const styles = {
     color: '#b3b1ad',
     fontFamily: "'SF Mono', monospace",
     padding: '20px',
+    display: 'flex',
+    flexDirection: 'column',
   },
   header: {
     display: 'flex',
@@ -218,6 +306,7 @@ const styles = {
     fontSize: '24px',
     fontWeight: 'bold',
     letterSpacing: '4px',
+    margin: 0,
   },
   statusBar: {
     display: 'flex',
@@ -234,6 +323,7 @@ const styles = {
     display: 'grid',
     gridTemplateColumns: '1fr 1.5fr 1.5fr',
     gap: '20px',
+    flex: 1,
   },
   pricesPanel: {
     background: '#12171f',
@@ -258,6 +348,7 @@ const styles = {
     fontSize: '12px',
     letterSpacing: '2px',
     marginBottom: '15px',
+    marginTop: 0,
   },
   priceRow: {
     display: 'flex',
@@ -344,5 +435,13 @@ const styles = {
     color: '#666',
     textAlign: 'center',
     padding: '20px',
+  },
+  footer: {
+    textAlign: 'center',
+    color: '#666',
+    fontSize: '12px',
+    marginTop: '20px',
+    paddingTop: '15px',
+    borderTop: '1px solid #2a2e38',
   },
 }
